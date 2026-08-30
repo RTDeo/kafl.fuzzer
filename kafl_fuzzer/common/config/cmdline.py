@@ -28,6 +28,7 @@ from kafl_fuzzer.coverage import start as cov_start
 from kafl_fuzzer.gui import start as gui_start
 from kafl_fuzzer.plot import start as plot_start
 from kafl_fuzzer.mcat import start as mcat_start
+from kafl_fuzzer.minimizer import start as minimize_start
 
 DEBUG_MODES_HELP = '<benchmark>\tperform performance benchmark\n' \
                     '<gdb>\t\trun payload with Qemu gdbserver (must compile without redqueen!)\n' \
@@ -46,6 +47,7 @@ class KaflSubcommands(Enum):
     GUI = auto()
     PLOT = auto()
     MCAT = auto()
+    MINIMIZE = auto()
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +151,8 @@ def add_args_debug(parser):
     parser.add_argument('-n', '--iterations', metavar='<n>', help='execute <n> times (for some actions)')
     parser.add_argument('--ptdump-path', required=False, metavar='<file>', help=hidden('path to ptdump executable'))
 
+def add_args_minimizer(parser):
+    parser.add_argument('--minimizer-variant', default='simple', choices=['simple', 'fast', 'extreme'])
 
 class ConfigParserBuilder():
 
@@ -163,6 +167,7 @@ class ConfigParserBuilder():
         self._add_gui_subcommand(subcommands)
         self._add_plot_subcommand(subcommands)
         self._add_mcat_subcommand(subcommands)
+        self._add_minimize_subcommand(subcommands)
         return parser
 
     def _base_parser(self) -> ArgumentParser:
@@ -233,3 +238,20 @@ class ConfigParserBuilder():
         mcat_subcommand.add_argument("pack_file", nargs="+", metavar="<msgpack file>", help="MessagePack file to decode")
 
         mcat_subcommand.set_defaults(func=mcat_start)
+
+    def _add_minimize_subcommand(self, parser: _SubParsersAction):
+        minimize_subcommand: ArgumentParser = parser.add_parser(KaflSubcommands.MINIMIZE.name.lower(), help="kAFL Minimizer")
+        
+        general_grp = minimize_subcommand.add_argument_group('General options')
+        add_args_general(general_grp)
+
+        debug_grp = minimize_subcommand.add_argument_group("Debug options")
+        add_args_debug(debug_grp)
+
+        qemu_grp = minimize_subcommand.add_argument_group('Qemu/Nyx options')
+        add_args_qemu(qemu_grp)
+
+        minimizer_grp = minimize_subcommand.add_argument_group('Minimizer options')
+        add_args_minimizer(minimizer_grp)
+
+        minimize_subcommand.set_defaults(func=minimize_start)
