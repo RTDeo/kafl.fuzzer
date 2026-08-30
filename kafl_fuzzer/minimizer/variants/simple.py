@@ -7,7 +7,7 @@ from kafl_fuzzer.minimizer.core import load_payload, create_chunk_offsets, creat
 log = logging.getLogger(__name__)
 
 
-def test_payload(q, payload: bytearray, offsets: tuple[int, int]) -> tuple[bool, ExecutionResult]:
+def test_payload(q, payload: bytearray) -> tuple[bool, ExecutionResult]:
     q.set_payload(payload)
     result = q.send_payload()
     if result.is_crash():
@@ -15,7 +15,6 @@ def test_payload(q, payload: bytearray, offsets: tuple[int, int]) -> tuple[bool,
     return (False, None)
 
 def minimize(config):
-    """Single-process complement-deletion minimizer."""
     log.info("Starting simple minimizer (single process)")
 
     payload = bytearray(load_payload(config))
@@ -26,7 +25,7 @@ def minimize(config):
         log.error("Failed to start Qemu")
         return -1
 
-    granularity = 1
+    granularity = 2
     iteration_counter = 1
     initial_payload_size = len(payload)
     
@@ -34,7 +33,10 @@ def minimize(config):
         # First, test the payload if it crashes
         log.info("Testing payload...")
         is_crash, offset = test_payload(q, payload)
-        # q.set_payload(bytearray(payload))
+        
+        if is_crash is False:
+            log.error("The payload did not crash!")
+            return -1
 
         while True:
             offsets = create_chunk_offsets(len(payload), granularity)
@@ -45,22 +47,20 @@ def minimize(config):
             log.info(f"Starting iteration {iteration_counter} with {len(offsets)} jobs")
 
             for offset in offsets:
-                if offset[0] == 0 and offset[1] == len(payload):  # granularity 1
-                    complement = bytearray(payload[:])
-                else:
-                    complement = bytearray(create_complement_payload(payload, offset))
+                complement = bytearray(create_complement_payload(payload, offset))
                 
-                q.set_payload(complement)
-                result = q.send_payload()
-                if result.is_crash():
+                is_crash, result = test_payload(q, complement)
+
+                if is_crash is True:
                     crash_offset = offset
                     log.debug(f"Crash found, offset: {offset}")
                     break
+
                 if not (offset[0] == 0 and offset[1] == len(payload)):  # also test the chunk alone
                     subset = bytearray(create_subset_payload(payload, offset))
-                    q.set_payload(subset)
-                    result = q.send_payload()
-                    if result.is_crash():
+                    
+                    is_crash, result = test_payload(q, complement)
+                    if is_crash is True:
                         subset_found = True
                         log.info(f"Subset crash found, offset: {offset}, shrinking payload")
                         break
