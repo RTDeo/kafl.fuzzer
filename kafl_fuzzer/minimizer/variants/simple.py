@@ -78,7 +78,13 @@ def ddmin_simple(q, initial_payload, _metrics) -> bytearray:
         # Test complements
         for offset in offsets:
             complement = create_complement_payload(payload, offset)
-            is_crash, _ = test_payload(q, complement)
+            is_crash = None
+            
+            if _metrics:
+                is_crash, _ = test_payload_with_metrics(q, complement, _metrics)
+            else:
+                is_crash, _ = test_payload(q, complement)
+
             if is_crash is True:
                 granularity = max(granularity - 1, 2)
                 log.debug(f"Crash found in complement, offset ({offset[0]},{offset[1]})")
