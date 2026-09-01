@@ -173,6 +173,7 @@ settings.validators.register(
     Validator("pack_file"),
     # minimizer
     Validator("minimizer_variant", default="simple", is_in=["simple", "fast", "extreme"]),
+    Validator("metrics", default=False, cast=bool),
     # internal for kAFL
     Validator("workdir_config", default=lambda config, _validator: str(Path(config.workdir) / DEFAULT_CONFIG_FILENAME), cast=cast_expand_path_no_verify),
     Validator("workdir_snap_state_meta", default=lambda config, _validator: str(Path(config.workdir) / WORKDIR_SNAPSHOT_DIRNAME / DEFAULT_CONFIG_SNAPSHOT_META_FILENAME), cast=cast_expand_path_no_verify)

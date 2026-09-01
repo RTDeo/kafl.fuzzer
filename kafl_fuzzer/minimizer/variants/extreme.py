@@ -1,6 +1,7 @@
 import logging
 import multiprocessing as m
 import ctypes
+import time
 
 from kafl_fuzzer.worker.qemu import qemu
 from kafl_fuzzer.common.util import filter_available_cpus
@@ -23,14 +24,14 @@ log = logging.getLogger(__name__)
 def print_stats_extreme(completed_jobs, all_jobs, window, payload_size, initial_payload_size):
     jobs = f"{completed_jobs}/{all_jobs}"
     current_payload_size = f"{payload_size}/{initial_payload_size}"
-    log.info(f"[MAIN]: Stats: {jobs} jobs completed | Window size: {window} | Current payload size: {current_payload_size}")
+    log.debug(f"[MAIN]: Stats: {jobs} jobs completed | Window size: {window} | Current payload size: {current_payload_size}")
 
 def wait_for_workers(condition_lock, completed_jobs, jobs):
     while True:
         with condition_lock:
             if condition_lock.wait_for(lambda: completed_jobs.value == jobs, timeout=1.0):
                 return
-            log.info("Waiting for workers...")
+            log.debug("Waiting for workers...")
 
 
 def ddmin_extreme(config, initial_payload):
@@ -47,6 +48,13 @@ def ddmin_extreme(config, initial_payload):
     crash_result = m.Array(ctypes.c_int, [-1, -1]) # Offsets of the crash result
     condition_lock = m.Condition() # Used for locking critical sections and notifying the main process
 
+    # Metrics
+    metrics_exec = None
+    metrics_time = None
+
+    if config.metrics:
+        metrics_exec = m.Value(ctypes.c_uint, -1) # We amount for the payload test
+
     workers: list[FastWorker] = [
         FastWorker(
             worker_id=worker_id,
@@ -57,6 +65,7 @@ def ddmin_extreme(config, initial_payload):
             result=crash_result,
             condition_lock=condition_lock,
             number_of_completed_jobs=completed_jobs,
+            metric_execution_count=metrics_exec
         )
         for worker_id in range(worker_count)
     ]
@@ -78,7 +87,7 @@ def ddmin_extreme(config, initial_payload):
                 # Check if crash found
                 if crash_result[0] != -1 and crash_result[1] != -1:
                     # Clear the queue
-                    log.info("Clearing queue")
+                    log.debug("Clearing queue")
                     while not job_queue.empty():
                         job_queue.get()
                     break
@@ -91,6 +100,9 @@ def ddmin_extreme(config, initial_payload):
         window = max(1, payload_size.value // 2)
 
         _iteration_counter = 0
+
+        if config.metrics:
+            metrics_time = time.perf_counter()
     
         while True:
             _iteration_counter += 1
@@ -103,7 +115,7 @@ def ddmin_extreme(config, initial_payload):
                 crash_result[0] = -1
                 crash_result[1] = -1
 
-            log.info(f"Iteration {_iteration_counter} with {job_count} jobs across {len(workers)} workers. ({payload_size.value}/{len(initial_payload)})")
+            log.debug(f"Iteration {_iteration_counter} with {job_count} jobs across {len(workers)} workers. ({payload_size.value}/{len(initial_payload)})")
 
             # Populate queue with subset jobs
             for offset in offsets:
@@ -124,7 +136,7 @@ def ddmin_extreme(config, initial_payload):
                         window = max(1, payload_size.value // 2)
                         break
                     if completed_jobs.value == job_count:
-                        log.info("Nothing found")
+                        log.debug("Nothing found")
                         break
 
             wait_for_workers(condition_lock, completed_jobs, job_count)
@@ -134,7 +146,7 @@ def ddmin_extreme(config, initial_payload):
             
             reset_shared_state(completed_jobs, crash_result)
 
-            log.info("Populating COMPLEMENT jobs...")
+            log.debug("Populating COMPLEMENT jobs...")
 
             for offset in offsets:
                 job_queue.put((offset[0], offset[1], JOB_COMPLEMENT))
@@ -154,7 +166,7 @@ def ddmin_extreme(config, initial_payload):
                         window = max(1, payload_size.value // 2)
                         break
                     if completed_jobs.value == job_count:
-                        log.info("Nothing found")
+                        log.debug("Nothing found")
                         break
 
             wait_for_workers(condition_lock, completed_jobs, job_count)
@@ -163,7 +175,7 @@ def ddmin_extreme(config, initial_payload):
                 continue
 
             if window <= 1:
-                log.info("Minimization done!")
+                log.info(f"Minimization done! File is now {payload_size.value} bytes")
                 break
 
             # Reduce the window by 1
@@ -177,6 +189,10 @@ def ddmin_extreme(config, initial_payload):
         log.error(f"Minimizer error: {e}")
         return -1
     finally:
+        if config.metrics:
+            metrics_time = time.perf_counter() - metrics_time
+            metrics_exec_count = metrics_exec.value
+            log.info(f"[METRICS] Execution time: {metrics_time}s | Execution count: {metrics_exec_count}")
         save_payload(config, payload, payload_size.value)
         graceful_exit(workers, None, None)
 

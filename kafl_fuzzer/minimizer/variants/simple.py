@@ -1,7 +1,10 @@
 import logging
+import time
+import multiprocessing as m
+import ctypes
 
 from kafl_fuzzer.worker.qemu import qemu
-from kafl_fuzzer.minimizer.core import test_payload, load_payload, create_chunk_offsets, create_complement_payload, create_subset_payload, save_payload
+from kafl_fuzzer.minimizer.core import test_payload_with_metrics, test_payload, load_payload, create_chunk_offsets, create_complement_payload, create_subset_payload, save_payload
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +40,8 @@ log = logging.getLogger(__name__)
 #     return ddmin(q, payload, min(len(payload), 2 * n))
 
 # Simple implementation of ddmin
-def ddmin_simple(q, initial_payload) -> bytearray:
+def ddmin_simple(q, initial_payload, _metrics) -> bytearray:
+
     _iteration_counter = 0
     granularity = 2
     payload = initial_payload
@@ -49,15 +53,21 @@ def ddmin_simple(q, initial_payload) -> bytearray:
         payload_size = len(payload)
         offsets = create_chunk_offsets(len(payload), granularity)
         
-        log.info(f"Iteration {_iteration_counter} with {len(offsets)} jobs. ({payload_size}/{len(initial_payload)})")
+        log.debug(f"Iteration {_iteration_counter} with {len(offsets)} jobs. ({payload_size}/{len(initial_payload)})")
 
         # Test subsets
         for offset in offsets:
             subset = create_subset_payload(payload, offset)
-            is_crash, _ = test_payload(q, subset)
+            is_crash = None
+
+            if _metrics:
+                is_crash, _ = test_payload_with_metrics(q, subset, _metrics)
+            else:
+                is_crash, _ = test_payload(q, subset)
+
             if is_crash is True:
                 granularity = 2
-                log.info(f"Crash found in subset, offset ({offset[0]},{offset[1]})")
+                log.debug(f"Crash found in subset, offset ({offset[0]},{offset[1]})")
                 payload = subset
                 break
 
@@ -71,7 +81,7 @@ def ddmin_simple(q, initial_payload) -> bytearray:
             is_crash, _ = test_payload(q, complement)
             if is_crash is True:
                 granularity = max(granularity - 1, 2)
-                log.info(f"Crash found in complement, offset ({offset[0]},{offset[1]})")
+                log.debug(f"Crash found in complement, offset ({offset[0]},{offset[1]})")
                 payload = complement
                 break
         
@@ -90,6 +100,9 @@ def minimize(config):
     
     q = qemu(1337, config, debug_mode=False, notifiers=True, resume=config.resume)
 
+    metrics_time = None
+    metrics_exec = None
+
     if not q.start():
         log.error("Failed to start Qemu")
         return -1
@@ -103,7 +116,13 @@ def minimize(config):
             log.error("The payload did not crash!")
             return -1
 
-        payload = ddmin_simple(q, payload)
+        if config.metrics:
+            metrics_time = time.perf_counter()
+            metrics_exec = m.Value(ctypes.c_uint, 0)
+
+        payload = ddmin_simple(q, payload, metrics_exec)
+
+        log.info(f"Minimization done! File is now {len(payload)} bytes")
     
     except KeyboardInterrupt:
         print("Got CTRL-C, aborting...")
@@ -112,6 +131,10 @@ def minimize(config):
         log.error(f"Minimizer error: {e}")
     
     finally:
+        if config.metrics:
+            metrics_time = time.perf_counter() - metrics_time
+            metrics_exec_count = metrics_exec.value
+            log.info(f"[METRICS] Execution time: {metrics_time}s | Execution count: {metrics_exec_count}")
         save_payload(config, payload, len(payload))
         q.shutdown()
     

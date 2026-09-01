@@ -1,13 +1,13 @@
 import logging
 import multiprocessing
+from multiprocessing.sharedctypes import Synchronized
 import os
 import signal
 import sys
 import time
-import traceback
 import queue
 
-from kafl_fuzzer.common.util import filter_available_cpus, read_binary_file
+from kafl_fuzzer.common.util import read_binary_file
 from kafl_fuzzer.worker.qemu import qemu
 from kafl_fuzzer.worker.execution_result import ExecutionResult
 from kafl_fuzzer.common.logger import WorkerLogAdapter
@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 
 JOB_SUBSET      = 0
 JOB_COMPLEMENT  = 1
-
 
 class FastWorker(multiprocessing.Process):
     def __init__(
@@ -28,7 +27,8 @@ class FastWorker(multiprocessing.Process):
             payload_size,
             result,
             condition_lock,
-            number_of_completed_jobs
+            number_of_completed_jobs,
+            metric_execution_count: Synchronized
     ):
         multiprocessing.Process.__init__(self, target=self.target)
         self.worker_id = worker_id
@@ -43,6 +43,11 @@ class FastWorker(multiprocessing.Process):
         self.result = result
         self.condition_lock = condition_lock
         self.number_of_completed_jobs = number_of_completed_jobs
+
+        # Metrics
+        self._metric_execution_count = metric_execution_count
+        if self._metric_execution_count:
+            self._metric_exists = True
 
     def target(self):
         try:
@@ -92,12 +97,17 @@ class FastWorker(multiprocessing.Process):
                 self.condition_lock.notify()
                 return
 
-        is_crash, _ = test_payload(self.qemu_instance, payload)
+        is_crash = None
+
+        if self._metric_exists:
+            is_crash, _ = test_payload_with_metrics(self.qemu_instance, payload, self._metric_execution_count)
+        else:
+            is_crash, _ = test_payload(self.qemu_instance, payload)
 
         with self.condition_lock:
             self.number_of_completed_jobs.value += 1
             if is_crash and not self.is_result_exist():
-                self.log.info(f"Worker {self.worker_id}: CRASH FOUND in {'subset' if job[2] == JOB_SUBSET else 'complement'}, offset: ({job[0]},{job[1]})")
+                self.log.debug(f"Worker {self.worker_id}: CRASH FOUND in {'subset' if job[2] == JOB_SUBSET else 'complement'}, offset: ({job[0]},{job[1]})")
                 self.result[0] = job[0]
                 self.result[1] = job[1]
             self.condition_lock.notify()
@@ -148,6 +158,16 @@ def graceful_exit(workers=[], signal=None, frame=None):
     return 0
 
 def test_payload(q, payload: bytearray) -> tuple[bool, ExecutionResult]:
+    q.set_payload(payload)
+    result = q.send_payload()
+    if result.is_crash() and result.exit_reason == "crash":
+        return (True, result)
+    return (False, None)
+
+def test_payload_with_metrics(q, payload: bytearray, metric: Synchronized) -> tuple[bool, ExecutionResult]:
+    with metric.get_lock():
+        metric.value += 1
+
     q.set_payload(payload)
     result = q.send_payload()
     if result.is_crash() and result.exit_reason == "crash":

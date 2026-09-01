@@ -152,7 +152,8 @@ def add_args_debug(parser):
     parser.add_argument('--ptdump-path', required=False, metavar='<file>', help=hidden('path to ptdump executable'))
 
 def add_args_minimizer(parser):
-    parser.add_argument('--minimizer-variant', default='simple', choices=['simple', 'fast', 'extreme'])
+    parser.add_argument('--minimizer-variant', default='simple', choices=['simple', 'fast', 'extreme'], help="Specify a minimizer variant (default is 'simple')")
+    parser.add_argument('--metrics', required=False, action="store_true", help="Collects metrics and displays them on screen")
 
 class ConfigParserBuilder():
 
