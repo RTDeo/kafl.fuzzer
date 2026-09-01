@@ -1,120 +1,190 @@
 import logging
-import multiprocessing
-import time
+import multiprocessing as m
+import ctypes
 
+from kafl_fuzzer.worker.qemu import qemu
 from kafl_fuzzer.common.util import filter_available_cpus
 from kafl_fuzzer.minimizer.core import (
-    Worker,
+    FastWorker,
     graceful_exit,
     load_payload,
     create_chunk_offsets,
     create_complement_payload,
+    create_subset_payload,
+    save_payload,
+    test_payload,
     reset_shared_state,
-    save_payload
+    JOB_SUBSET,
+    JOB_COMPLEMENT
 )
 
 log = logging.getLogger(__name__)
 
+def print_stats(completed_jobs, all_jobs, granularity, payload_size, initial_payload_size):
+    jobs = f"{completed_jobs}/{all_jobs}"
+    granularity_s = f"{granularity}"
+    chunk_size = f"{payload_size // granularity}"
+    current_payload_size = f"{payload_size}/{initial_payload_size}"
+    log.info(f"[MAIN]: Stats: {jobs} jobs completed | Granularity: {granularity_s} | Chunk size: {chunk_size} | Current payload size: {current_payload_size}")
 
-def minimize(config):
-    log.info("Hello")
-    payload = load_payload(config)
+def ddmin_fast(config, initial_payload):
+    worker_count = config.processes
+    # Updated by main process
+    payload = m.Array(ctypes.c_ubyte, initial_payload)
+    payload_size = m.Value(ctypes.c_uint, len(payload))
+    job_queue: m.Queue[tuple[int, int, int]] = m.Queue() # (start, end, 0|1 (subset or complement))
 
-    avail, _ = filter_available_cpus()
-    assert config.processes <= len(avail), "Not enough vCPUs available"
+    # Updated by main process and workers
+    completed_jobs = m.Value(ctypes.c_uint, 0)
 
-    number_of_workers = config.processes
+    # Updated by workers
+    crash_result = m.Array(ctypes.c_int, [-1, -1]) # Offsets of the crash result
+    condition_lock = m.Condition() # Used for locking critical sections and notifying the main process
 
-    # Move the payload to a shared memory region so that all workers can access it
-    payload = multiprocessing.Array("B", payload)
-
-    # main -> worker
-    job_queue: multiprocessing.Queue[tuple[int, int]] = multiprocessing.Queue()
-
-    # worker -> main
-    # (crash_offset_start, crash_offset_end)
-    shared_result = multiprocessing.Array("i", [-1, -1])  # [-1, -1] if no crash found, otherwise offset
-    shared_number_of_completed_jobs = multiprocessing.Value("i", 0)  # number of completed jobs
-    shared_payload_size = multiprocessing.Value("I", len(payload))
-
-    workers: list[Worker] = [
-        Worker(
+    workers: list[FastWorker] = [
+        FastWorker(
             worker_id=worker_id,
             qemu_config=config,
             payload=payload,
-            payload_size=shared_payload_size,
+            payload_size=payload_size,
             input_queue=job_queue,
-            result=shared_result,
-            number_of_completed_jobs=shared_number_of_completed_jobs,
+            result=crash_result,
+            condition_lock=condition_lock,
+            number_of_completed_jobs=completed_jobs,
         )
-        for worker_id in range(number_of_workers)
+        for worker_id in range(worker_count)
     ]
 
+    # Start up the workers
     for worker in workers:
         worker.start()
 
-    granularity = 1
-    iteration_counter = 1
-    initial_payload_size = len(payload)
-    taken_jobs = 0
     try:
+        # First, check if payload works
+        job_queue.put((0, len(initial_payload), JOB_SUBSET))
+
         while True:
-            # prepare jobs and queue
-            jobs: list[tuple[int, int]] = create_chunk_offsets(shared_payload_size.value, granularity)  # calculate offsets
-            number_of_jobs = len(jobs)
-            for job in jobs:  # enqueue offsets
-                job_queue.put(job)
-            log.info(f"Starting iteration {iteration_counter} with {number_of_jobs} jobs")
-
-            # wait until crash is found or all jobs are done
-            time_delta = 0
-            while True:
-                if number_of_jobs == shared_number_of_completed_jobs.value or not (shared_result[0] == -1 and shared_result[1] == -1):
-                    print(f"[MAIN]: Finished iteration {iteration_counter}, {shared_number_of_completed_jobs.value}/{number_of_jobs} jobs done, crash found: {shared_result[:]}")
+            with condition_lock:
+                finished = condition_lock.wait_for(lambda: (crash_result[0] != -1 and crash_result[1] != -1) or completed_jobs.value == 1, timeout=1.0)
+                if not finished:
+                    # print_stats(completed_jobs.value, 1, granularity, payload_size.value, len(initial_payload))
+                    continue
+                # Check if crash found
+                if crash_result[0] != -1 and crash_result[1] != -1:
+                    # Clear the queue
+                    log.info("Clearing queue")
+                    while not job_queue.empty():
+                        job_queue.get()
                     break
-                time.sleep(0.1)
-                if time_delta >= 1.0:
-                    time_delta = 0
-                    print(f"[MAIN]: Stats: {number_of_jobs - shared_number_of_completed_jobs.value}/{number_of_jobs} jobs left | Granularity: {granularity} | Payload size: {shared_payload_size.value}/{initial_payload_size} | Chunk size: {shared_payload_size.value//granularity}")
-                time_delta += 0.1
+                else:
+                    log.error("Payload did not crash")
+                    return
 
-            # clear queue before next iteration
-            while not job_queue.empty():
-                job_queue.get()
-                taken_jobs += 1
+        reset_shared_state(completed_jobs, crash_result)
 
-            # Check if all workers finished
-            while (shared_number_of_completed_jobs.value + taken_jobs) != number_of_jobs:
-                time.sleep(0.1)
-                if time_delta >= 1.0:
-                    time_delta = 0
-                    print(f"[MAIN]: Waiting for workers to finish: {shared_number_of_completed_jobs.value + taken_jobs}/{number_of_jobs}")
-                time_delta += 0.1
+        granularity = 2
+        _iteration_counter = 0
+    
+        while True:
+            _iteration_counter += 1
+            offsets = create_chunk_offsets(payload_size.value, granularity)
+            job_count = len(offsets)
 
-            # check if scripts work is done
-            if granularity == shared_payload_size.value and shared_result[0] == -1 and shared_result[1] == -1:
-                print("Minimization done!")
+            # Reset the state used by workers
+            with condition_lock:
+                completed_jobs.value = 0
+                crash_result[0] = -1
+                crash_result[1] = -1
+
+            log.info(f"Iteration {_iteration_counter} with {job_count} jobs across {len(workers)} workers. ({payload_size.value}/{len(initial_payload)})")
+
+            # Populate queue with subset jobs
+            for offset in offsets:
+                job_queue.put((offset[0], offset[1], JOB_SUBSET))
+
+            while True:
+                with condition_lock:
+                    finished = condition_lock.wait_for(lambda: (crash_result[0] != -1 and crash_result[1] != -1) or completed_jobs.value == job_count, timeout=1.0)
+                    if not finished:
+                        print_stats(completed_jobs.value, job_count, granularity, payload_size.value, len(initial_payload))
+                        continue
+                    # Check if crash found
+                    if crash_result[0] != -1 and crash_result[1] != -1:
+                        # Clear the queue
+                        log.info("Clearing queue")
+                        while not job_queue.empty():
+                            job_queue.get()
+                        # Reset granularity to 2
+                        granularity = 2
+                        new_payload = bytearray(create_subset_payload(payload, (crash_result[0], crash_result[1])))
+                        payload[:len(new_payload)] = new_payload
+                        payload_size.value = len(new_payload)
+                        break
+                    if completed_jobs.value == job_count:
+                        log.info("Nothing found")
+                        break
+
+            if crash_result[0] != -1 and crash_result[1] != -1:
+                continue
+            
+            completed_jobs.value = 0
+
+            log.info("Populating COMPLEMENT jobs...")
+
+            for offset in offsets:
+                job_queue.put((offset[0], offset[1], JOB_COMPLEMENT))
+
+            while True:
+                with condition_lock:
+                    finished = condition_lock.wait_for(lambda: (crash_result[0] != -1 and crash_result[1] != -1) or completed_jobs.value == job_count, timeout=1.0)
+                    if not finished:
+                        print_stats(completed_jobs.value, job_count, granularity, payload_size.value, len(initial_payload))
+                        continue
+                    # Check if crash found
+                    if crash_result[0] != -1 and crash_result[1] != -1:
+                        # Clear the queue
+                        log.info("Clearing queue")
+                        while not job_queue.empty():
+                            job_queue.get()
+                        # Reset granularity to min(n - 1, 2)
+                        granularity = max(granularity - 1, 2)
+                        new_payload = bytearray(create_complement_payload(payload, (crash_result[0], crash_result[1]), payload_size.value))
+
+                        payload[:len(new_payload)] = new_payload
+                        payload_size.value = len(new_payload)
+                        break
+                    if completed_jobs.value == job_count:
+                        log.info("Nothing found")
+                        break
+
+            if crash_result[0] != -1 and crash_result[1] != -1:
+                continue
+
+            if granularity == payload_size.value:
+                log.info("Minimization done!")
                 break
 
-            # adjust granularity
-            if not (shared_result[0] == -1 and shared_result[1] == -1): # If a crash occured, change both the payload size and the payload itself
-                if not (shared_result[0] == 0 and shared_result[1] == shared_payload_size.value): # Granularity of 1 will just test the input
-                    shared_payload_size.value = shared_payload_size.value - (shared_result[1] - shared_result[0])
-                    complement = bytearray(create_complement_payload(payload, (shared_result[0], shared_result[1])))
-                    for i, b in enumerate(complement):
-                        payload[i] = b
-                granularity = max(granularity - 1, 2)
-            else:
-                if granularity == 1: # Test input did not crash
-                    print("Initial input did not crash!!!")
-                    break
-                granularity = min(granularity * 2, shared_payload_size.value)
-            print(f"Granularity changed to {granularity}, payload size is {shared_payload_size.value}/{initial_payload_size}")
-            reset_shared_state(shared_number_of_completed_jobs, shared_result)
-            taken_jobs = 0
-            iteration_counter += 1
+            # Double the granularity
+            granularity = min(payload_size.value, granularity * 2)
+                        
+
     except KeyboardInterrupt:
-        print("Got CTRL-C, shutting down workers...")
+        print("Got CTRL-C, aborting...")
+        return 0
+    except Exception as e:
+        log.error(f"Minimizer error: {e}")
+        return -1
     finally:
-        save_payload(config, payload, shared_payload_size.value)
+        save_payload(config, payload, payload_size.value)
         graceful_exit(workers, None, None)
+
+
+def minimize(config):
+    log.info("Starting fast minimizer")
+
+    payload = bytearray(load_payload(config))
+
+    avail, _ = filter_available_cpus()
+    assert config.processes <= len(avail), "Not enough vCPUs available"
+    
+    return ddmin_fast(config, payload)

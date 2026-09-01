@@ -1,98 +1,118 @@
 import logging
 
 from kafl_fuzzer.worker.qemu import qemu
-from kafl_fuzzer.worker.execution_result import ExecutionResult
-from kafl_fuzzer.minimizer.core import load_payload, create_chunk_offsets, create_complement_payload, create_subset_payload, save_payload
+from kafl_fuzzer.minimizer.core import test_payload, load_payload, create_chunk_offsets, create_complement_payload, create_subset_payload, save_payload
 
 log = logging.getLogger(__name__)
 
 
-def test_payload(q, payload: bytearray) -> tuple[bool, ExecutionResult]:
-    q.set_payload(payload)
-    result = q.send_payload()
-    if result.is_crash():
-        return (True, result)
-    return (False, None)
+
+
+# Original recursive ddmin, used as a reference
+# def ddmin(q, payload, n) -> bytearray:
+#     # Divide to chunks of n
+#     offsets = create_chunk_offsets(len(payload), n)
+    
+#     # Test subsets
+#     for offset in offsets:
+#         subset = create_subset_payload(payload, offset)
+#         is_crash, _ = test_payload(q, subset)
+#         if is_crash is True:
+#             # Reset granularity to 2
+#             n = 2
+#             return ddmin(q, subset, n)
+    
+#     for offset in offsets:
+#         complement = create_complement_payload(payload, offset)
+#         is_crash, _ = test_payload(q, complement)
+#         if is_crash is True:
+#             # Reset granularity to max(n-1, 2)
+#             return ddmin(q, complement, max(n - 1, 2))
+    
+#     # No crash found, check if granularity is at payload size (1 byte chunks mean we have the answer)
+#     if n == len(payload):
+#         return payload
+
+#     # Double granularity
+#     return ddmin(q, payload, min(len(payload), 2 * n))
+
+# Simple implementation of ddmin
+def ddmin_simple(q, initial_payload) -> bytearray:
+    _iteration_counter = 0
+    granularity = 2
+    payload = initial_payload
+
+    while True:
+        _iteration_counter += 1
+        is_crash = False
+        current_granularity = granularity
+        payload_size = len(payload)
+        offsets = create_chunk_offsets(len(payload), granularity)
+        
+        log.info(f"Iteration {_iteration_counter} with {len(offsets)} jobs. ({payload_size}/{len(initial_payload)})")
+
+        # Test subsets
+        for offset in offsets:
+            subset = create_subset_payload(payload, offset)
+            is_crash, _ = test_payload(q, subset)
+            if is_crash is True:
+                granularity = 2
+                log.info(f"Crash found in subset, offset ({offset[0]},{offset[1]})")
+                payload = subset
+                break
+
+        # If we hit subset, do the next iteration
+        if is_crash is True:
+            continue
+
+        # Test complements
+        for offset in offsets:
+            complement = create_complement_payload(payload, offset)
+            is_crash, _ = test_payload(q, complement)
+            if is_crash is True:
+                granularity = max(granularity - 1, 2)
+                log.info(f"Crash found in complement, offset ({offset[0]},{offset[1]})")
+                payload = complement
+                break
+        
+        if is_crash is False:
+            if current_granularity == payload_size:
+                break
+            # Double the granularity
+            granularity = min(len(payload), 2 * granularity)
+    
+    return payload
 
 def minimize(config):
-    log.info("Starting simple minimizer (single process)")
-
+    log.info("Starting simple minimizer")
+    
     payload = bytearray(load_payload(config))
-
+    
     q = qemu(1337, config, debug_mode=False, notifiers=True, resume=config.resume)
 
     if not q.start():
         log.error("Failed to start Qemu")
         return -1
 
-    granularity = 2
-    iteration_counter = 1
-    initial_payload_size = len(payload)
-    
     try:
-        # First, test the payload if it crashes
-        log.info("Testing payload...")
-        is_crash, offset = test_payload(q, payload)
+        # Before starting, test if payload even crashes
+        log.info("Testing the payload first...")
+        is_crash, _ = test_payload(q, payload)
         
         if is_crash is False:
             log.error("The payload did not crash!")
             return -1
 
-        while True:
-            offsets = create_chunk_offsets(len(payload), granularity)
-
-            crash_offset = None
-            subset_found = False
-
-            log.info(f"Starting iteration {iteration_counter} with {len(offsets)} jobs")
-
-            for offset in offsets:
-                complement = bytearray(create_complement_payload(payload, offset))
-                
-                is_crash, result = test_payload(q, complement)
-
-                if is_crash is True:
-                    crash_offset = offset
-                    log.debug(f"Crash found, offset: {offset}")
-                    break
-
-                if not (offset[0] == 0 and offset[1] == len(payload)):  # also test the chunk alone
-                    subset = bytearray(create_subset_payload(payload, offset))
-                    
-                    is_crash, result = test_payload(q, complement)
-                    if is_crash is True:
-                        subset_found = True
-                        log.info(f"Subset crash found, offset: {offset}, shrinking payload")
-                        break
-
-            # done: byte-level granularity and nothing crashed
-            if granularity == len(payload) and crash_offset is None and not subset_found:
-                print("Minimization done!")
-                break
-
-            # adjust granularity
-            if crash_offset is not None:
-                if not (crash_offset[0] == 0 and crash_offset[1] == len(payload)):
-                    del payload[crash_offset[0]:crash_offset[1]]
-                if len(payload) <= 1:  # nothing left to reduce
-                    print("Minimization done!")
-                    break
-                granularity = min(max(granularity - 1, 2), len(payload))
-            elif subset_found:
-                payload = subset
-                granularity = min(2, len(payload))
-            else:
-                if granularity == 1:  # test input did not crash
-                    print("Initial input did not crash!!!")
-                    break
-                granularity = min(granularity * 2, len(payload))
-            print(f"Granularity changed to {granularity}, payload size is {len(payload)}/{initial_payload_size}")
-            iteration_counter += 1
+        payload = ddmin_simple(q, payload)
+    
     except KeyboardInterrupt:
         print("Got CTRL-C, aborting...")
+    
     except Exception as e:
         log.error(f"Minimizer error: {e}")
+    
     finally:
         save_payload(config, payload, len(payload))
         q.shutdown()
+    
     return 0
