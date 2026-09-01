@@ -92,12 +92,11 @@ class FastWorker(multiprocessing.Process):
                 self.condition_lock.notify()
                 return
 
-        self.qemu_instance.set_payload(payload)
-        result = self.qemu_instance.send_payload()
+        is_crash, _ = test_payload(self.qemu_instance, payload)
 
         with self.condition_lock:
             self.number_of_completed_jobs.value += 1
-            if result.is_crash() and not self.is_result_exist():
+            if is_crash and not self.is_result_exist():
                 self.log.info(f"Worker {self.worker_id}: CRASH FOUND in {'subset' if job[2] == JOB_SUBSET else 'complement'}, offset: ({job[0]},{job[1]})")
                 self.result[0] = job[0]
                 self.result[1] = job[1]
@@ -151,7 +150,7 @@ def graceful_exit(workers=[], signal=None, frame=None):
 def test_payload(q, payload: bytearray) -> tuple[bool, ExecutionResult]:
     q.set_payload(payload)
     result = q.send_payload()
-    if result.is_crash():
+    if result.is_crash() and result.exit_reason == "crash":
         return (True, result)
     return (False, None)
 
