@@ -2,7 +2,6 @@ import logging
 import multiprocessing as m
 import ctypes
 
-from kafl_fuzzer.worker.qemu import qemu
 from kafl_fuzzer.common.util import filter_available_cpus
 from kafl_fuzzer.minimizer.core import (
     FastWorker,
@@ -12,7 +11,6 @@ from kafl_fuzzer.minimizer.core import (
     create_complement_payload,
     create_subset_payload,
     save_payload,
-    test_payload,
     reset_shared_state,
     JOB_SUBSET,
     JOB_COMPLEMENT
@@ -26,6 +24,13 @@ def print_stats(completed_jobs, all_jobs, granularity, payload_size, initial_pay
     chunk_size = f"{payload_size // granularity}"
     current_payload_size = f"{payload_size}/{initial_payload_size}"
     log.info(f"[MAIN]: Stats: {jobs} jobs completed | Granularity: {granularity_s} | Chunk size: {chunk_size} | Current payload size: {current_payload_size}")
+
+def wait_for_workers(condition_lock, completed_jobs, jobs):
+    while True:
+        with condition_lock:
+            if condition_lock.wait_for(lambda: completed_jobs.value == jobs, timeout=1.0):
+                return
+            log.info("Waiting for workers...")
 
 def ddmin_fast(config, initial_payload):
     worker_count = config.processes
@@ -110,10 +115,6 @@ def ddmin_fast(config, initial_payload):
                         continue
                     # Check if crash found
                     if crash_result[0] != -1 and crash_result[1] != -1:
-                        # Clear the queue
-                        log.info("Clearing queue")
-                        while not job_queue.empty():
-                            job_queue.get()
                         # Reset granularity to 2
                         granularity = 2
                         new_payload = bytearray(create_subset_payload(payload, (crash_result[0], crash_result[1])))
@@ -124,10 +125,12 @@ def ddmin_fast(config, initial_payload):
                         log.info("Nothing found")
                         break
 
+            wait_for_workers(condition_lock, completed_jobs, job_count)
+            
             if crash_result[0] != -1 and crash_result[1] != -1:
                 continue
             
-            completed_jobs.value = 0
+            reset_shared_state(completed_jobs, crash_result)
 
             log.info("Populating COMPLEMENT jobs...")
 
@@ -142,10 +145,6 @@ def ddmin_fast(config, initial_payload):
                         continue
                     # Check if crash found
                     if crash_result[0] != -1 and crash_result[1] != -1:
-                        # Clear the queue
-                        log.info("Clearing queue")
-                        while not job_queue.empty():
-                            job_queue.get()
                         # Reset granularity to min(n - 1, 2)
                         granularity = max(granularity - 1, 2)
                         new_payload = bytearray(create_complement_payload(payload, (crash_result[0], crash_result[1]), payload_size.value))
@@ -156,6 +155,8 @@ def ddmin_fast(config, initial_payload):
                     if completed_jobs.value == job_count:
                         log.info("Nothing found")
                         break
+
+            wait_for_workers(condition_lock, completed_jobs, job_count)
 
             if crash_result[0] != -1 and crash_result[1] != -1:
                 continue

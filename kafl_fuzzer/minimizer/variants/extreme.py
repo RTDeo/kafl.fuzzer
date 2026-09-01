@@ -1,2 +1,192 @@
+import logging
+import multiprocessing as m
+import ctypes
+
+from kafl_fuzzer.worker.qemu import qemu
+from kafl_fuzzer.common.util import filter_available_cpus
+from kafl_fuzzer.minimizer.core import (
+    FastWorker,
+    graceful_exit,
+    load_payload,
+    create_sliding_window_offsets,
+    create_complement_payload,
+    create_subset_payload,
+    save_payload,
+    test_payload,
+    reset_shared_state,
+    JOB_SUBSET,
+    JOB_COMPLEMENT
+)
+
+log = logging.getLogger(__name__)
+
+def print_stats_extreme(completed_jobs, all_jobs, window, payload_size, initial_payload_size):
+    jobs = f"{completed_jobs}/{all_jobs}"
+    current_payload_size = f"{payload_size}/{initial_payload_size}"
+    log.info(f"[MAIN]: Stats: {jobs} jobs completed | Window size: {window} | Current payload size: {current_payload_size}")
+
+def wait_for_workers(condition_lock, completed_jobs, jobs):
+    while True:
+        with condition_lock:
+            if condition_lock.wait_for(lambda: completed_jobs.value == jobs, timeout=1.0):
+                return
+            log.info("Waiting for workers...")
+
+
+def ddmin_extreme(config, initial_payload):
+    worker_count = config.processes
+    # Updated by main process
+    payload = m.Array(ctypes.c_ubyte, initial_payload)
+    payload_size = m.Value(ctypes.c_uint, len(payload))
+    job_queue: m.Queue[tuple[int, int, int]] = m.Queue() # (start, end, 0|1 (subset or complement))
+
+    # Updated by main process and workers
+    completed_jobs = m.Value(ctypes.c_uint, 0)
+
+    # Updated by workers
+    crash_result = m.Array(ctypes.c_int, [-1, -1]) # Offsets of the crash result
+    condition_lock = m.Condition() # Used for locking critical sections and notifying the main process
+
+    workers: list[FastWorker] = [
+        FastWorker(
+            worker_id=worker_id,
+            qemu_config=config,
+            payload=payload,
+            payload_size=payload_size,
+            input_queue=job_queue,
+            result=crash_result,
+            condition_lock=condition_lock,
+            number_of_completed_jobs=completed_jobs,
+        )
+        for worker_id in range(worker_count)
+    ]
+
+    # Start up the workers
+    for worker in workers:
+        worker.start()
+
+    try:
+        # First, check if payload works
+        job_queue.put((0, len(initial_payload), JOB_SUBSET))
+
+        while True:
+            with condition_lock:
+                finished = condition_lock.wait_for(lambda: (crash_result[0] != -1 and crash_result[1] != -1) or completed_jobs.value == 1, timeout=1.0)
+                if not finished:
+                    # print_stats(completed_jobs.value, 1, granularity, payload_size.value, len(initial_payload))
+                    continue
+                # Check if crash found
+                if crash_result[0] != -1 and crash_result[1] != -1:
+                    # Clear the queue
+                    log.info("Clearing queue")
+                    while not job_queue.empty():
+                        job_queue.get()
+                    break
+                else:
+                    log.error("Payload did not crash")
+                    return
+
+        reset_shared_state(completed_jobs, crash_result)
+
+        window = max(1, payload_size.value // 2)
+
+        _iteration_counter = 0
+    
+        while True:
+            _iteration_counter += 1
+            offsets = create_sliding_window_offsets(payload_size.value, window)
+            job_count = len(offsets)
+
+            # Reset the state used by workers
+            with condition_lock:
+                completed_jobs.value = 0
+                crash_result[0] = -1
+                crash_result[1] = -1
+
+            log.info(f"Iteration {_iteration_counter} with {job_count} jobs across {len(workers)} workers. ({payload_size.value}/{len(initial_payload)})")
+
+            # Populate queue with subset jobs
+            for offset in offsets:
+                job_queue.put((offset[0], offset[1], JOB_SUBSET))
+
+            while True:
+                with condition_lock:
+                    finished = condition_lock.wait_for(lambda: (crash_result[0] != -1 and crash_result[1] != -1) or completed_jobs.value == job_count, timeout=1.0)
+                    if not finished:
+                        print_stats_extreme(completed_jobs.value, job_count, window, payload_size.value, len(initial_payload))
+                        continue
+                    # Check if crash found
+                    if crash_result[0] != -1 and crash_result[1] != -1:
+                        new_payload = bytearray(create_subset_payload(payload, (crash_result[0], crash_result[1])))
+                        payload[:len(new_payload)] = new_payload
+                        payload_size.value = len(new_payload)
+                        # Reset to half the payload size
+                        window = max(1, payload_size.value // 2)
+                        break
+                    if completed_jobs.value == job_count:
+                        log.info("Nothing found")
+                        break
+
+            wait_for_workers(condition_lock, completed_jobs, job_count)
+            
+            if crash_result[0] != -1 and crash_result[1] != -1:
+                continue
+            
+            reset_shared_state(completed_jobs, crash_result)
+
+            log.info("Populating COMPLEMENT jobs...")
+
+            for offset in offsets:
+                job_queue.put((offset[0], offset[1], JOB_COMPLEMENT))
+
+            while True:
+                with condition_lock:
+                    finished = condition_lock.wait_for(lambda: (crash_result[0] != -1 and crash_result[1] != -1) or completed_jobs.value == job_count, timeout=1.0)
+                    if not finished:
+                        print_stats_extreme(completed_jobs.value, job_count, window, payload_size.value, len(initial_payload))
+                        continue
+                    # Check if crash found
+                    if crash_result[0] != -1 and crash_result[1] != -1:
+                        new_payload = bytearray(create_complement_payload(payload, (crash_result[0], crash_result[1]), payload_size.value))
+
+                        payload[:len(new_payload)] = new_payload
+                        payload_size.value = len(new_payload)
+                        window = max(1, payload_size.value // 2)
+                        break
+                    if completed_jobs.value == job_count:
+                        log.info("Nothing found")
+                        break
+
+            wait_for_workers(condition_lock, completed_jobs, job_count)
+
+            if crash_result[0] != -1 and crash_result[1] != -1:
+                continue
+
+            if window <= 1:
+                log.info("Minimization done!")
+                break
+
+            # Reduce the window by 1
+            window -= 1
+                        
+
+    except KeyboardInterrupt:
+        print("Got CTRL-C, aborting...")
+        return 0
+    except Exception as e:
+        log.error(f"Minimizer error: {e}")
+        return -1
+    finally:
+        save_payload(config, payload, payload_size.value)
+        graceful_exit(workers, None, None)
+
+
 def minimize(config):
-    raise NotImplementedError("Not implemented")
+    log.info("Starting extreme minimizer")
+
+    payload = bytearray(load_payload(config))
+
+    avail, _ = filter_available_cpus()
+    assert config.processes <= len(avail), "Not enough vCPUs available"
+    
+    return ddmin_extreme(config, payload)

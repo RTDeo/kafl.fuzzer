@@ -79,6 +79,8 @@ class FastWorker(multiprocessing.Process):
 
         with self.condition_lock:
             if self.is_result_exist():
+                self.number_of_completed_jobs.value += 1
+                self.condition_lock.notify()
                 return
             if job[2] == JOB_SUBSET:
                 payload = bytearray(create_subset_payload(self.payload, (job[0], job[1])))
@@ -86,19 +88,19 @@ class FastWorker(multiprocessing.Process):
                 payload = bytearray(create_complement_payload(self.payload, (job[0], job[1]), self.payload_size.value))
             else:
                 log.error("Unknown job type")
+                self.number_of_completed_jobs.value += 1
+                self.condition_lock.notify()
                 return
 
         self.qemu_instance.set_payload(payload)
         result = self.qemu_instance.send_payload()
 
         with self.condition_lock:
-            if result.is_crash():
-                if self.is_result_exist():
-                    return
-                self.log.info(f"Worker {self.worker_id}: CRASH FOUND in {"subset" if job[2] == JOB_SUBSET else "complement"}, offset: ({job[0]},{job[1]})")
+            self.number_of_completed_jobs.value += 1
+            if result.is_crash() and not self.is_result_exist():
+                self.log.info(f"Worker {self.worker_id}: CRASH FOUND in {'subset' if job[2] == JOB_SUBSET else 'complement'}, offset: ({job[0]},{job[1]})")
                 self.result[0] = job[0]
                 self.result[1] = job[1]
-            self.number_of_completed_jobs.value += 1
             self.condition_lock.notify()
 
     def init_qemu(self):
@@ -126,111 +128,6 @@ class FastWorker(multiprocessing.Process):
             sys.exit(0)
         else:
             sys.exit(0)
-
-# class FastWorker(multiprocessing.Process):
-#     def __init__(
-#             self,
-#             worker_id: int,
-#             qemu_config,
-#             input_queue: multiprocessing.Queue,
-#             payload,
-#             payload_size,
-#             result,
-#             crash_event,
-#             number_of_completed_jobs
-#     ):
-#         multiprocessing.Process.__init__(self, target=self.target)
-#         self.worker_id = worker_id
-#         self.qemu_config = qemu_config
-#         self.qemu_instance = None
-#         self.logger_no_prefix = logging.getLogger(__name__)
-#         self.log = WorkerLogAdapter(self.logger_no_prefix, {'pid': self.worker_id})
-#         # shared variables
-#         self.input_queue: multiprocessing.Queue[tuple[int, int]] = input_queue
-#         self.payload = payload
-#         self.payload_size = payload_size
-#         self.result = result
-#         self.crash_event = crash_event
-#         self.number_of_completed_jobs = number_of_completed_jobs
-
-#     def target(self):
-#         try:
-#             signal.signal(signal.SIGTERM, self.sigterm_handler)
-#             self.log.info(f"Initializing worker {self.worker_id}")
-#             self.worker_loop()
-#             self.shutdown_worker()
-#         except KeyboardInterrupt:
-#             self.shutdown_worker()
-
-#     def worker_loop(self):
-#         if self.init_qemu() is None:
-#             return
-#         while True:
-#             job = self.get_job()
-#             if job is None: # Queue is empty which means that the iteration ended and the queue will be populated soon
-#                 continue
-#             self.handle_job(job)
-
-#     def init_qemu(self):
-#         self.qemu_instance = qemu(
-#             self.worker_id,
-#             self.qemu_config,
-#             debug_mode=False,
-#             notifiers=True,
-#             resume=self.qemu_config.resume,
-#         )
-#         if not self.qemu_instance.start():
-#             self.log.error("Failed to start Qemu")
-#             return
-
-#         return True
-
-#     def get_job(self):
-#         # get next job from queue
-#         if not (self.result[0] == -1 and self.result[1] == -1): # An error has been found by one of the workers, wait for change in value
-#             time.sleep(0.1)
-#             return None
-#         try:
-#             job = self.input_queue.get(timeout=0.1)
-#             return job
-#         except queue.Empty: # No offset left in queue, the queue will be populated soon
-#             return None
-
-#     def handle_job(self, offset: tuple[int, int]):
-#         """Handle single complement job"""
-#         try:
-#             if offset[0] == 0 and offset[1] == self.payload_size.value: # Granularity of 1, test the input
-#                 self.log.info("Testing initial input...")
-#                 complement = bytearray(self.payload[:])
-#             else:
-#                 complement = bytearray(create_complement_payload(self.payload, offset, self.payload_size.value))
-#             self.qemu_instance.set_payload(complement)
-#             result = self.qemu_instance.send_payload()
-
-#             if result.is_crash():
-#                 log.debug(f"Worker {self.worker_id}: crash found, offset: {offset}")
-#                 with self.result.get_lock():
-#                     if self.result[0] == -1 and self.result[1] == -1: # We check first because multiple workers can find a crash and can wait for the lock, the first crash is what we are interested in
-#                         self.result[0] = offset[0]
-#                         self.result[1] = offset[1]
-
-#             with self.number_of_completed_jobs.get_lock():
-#                 self.number_of_completed_jobs.value += 1
-
-#         except Exception as e:
-#             log.error(f"Worker {self.worker_id}: ERROR - {e}")
-#             log.error(traceback.format_exc())
-#             self.shutdown_worker()
-
-#     def shutdown_worker(self):
-#         log.debug("Shutting down worker")
-#         self.sigterm_handler()
-
-#     def sigterm_handler(self, signal=None, frame=None):
-#         if self.qemu_instance:
-#             self.log.debug(f"Worker {self.worker_id}: SIGTERM")
-#             self.qemu_instance.async_exit()
-#             sys.exit(0)
 
 
 def graceful_exit(workers=[], signal=None, frame=None):
@@ -284,6 +181,20 @@ def reset_shared_state(shared_number_of_completed_jobs, shared_result):
 def create_chunk_offsets(payload_len, granularity) -> list[tuple[int, int]]:
     """ Create list of offsets from given payload length and granularity """
     return [(i*payload_len//granularity, (i+1)*payload_len//granularity) for i in range(granularity)]
+
+def create_sliding_window_offsets(payload_len, window_size) -> list[tuple[int, int]]:
+    """ Create list of offsets iterated by 1 byte """
+    result = []
+    i = 0
+
+    if window_size < 1:
+        return result
+
+    while i + window_size <= payload_len:
+        result.append((i, i + window_size))
+        i += 1
+    return result
+
 
 def save_payload(config, payload, payload_size):
     with open(config.workdir + "/minimized_payload", "wb") as fh:
